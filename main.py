@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-import anthropic
+import google.generativeai as genai
 import sqlite3
 
 app = FastAPI()
@@ -30,7 +30,7 @@ def init_db():
     conn.commit(); conn.close()
 
 init_db()
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
 class AgentCreate(BaseModel):
     name: str; role: str
@@ -122,7 +122,6 @@ def get_messages(aid: str):
 
 @app.post("/agents/{aid}/chat")
 def chat(aid: str, msg: ChatMessage):
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     conn = get_db()
     if aid == "orchestrator":
         system = build_orchestrator_prompt()
@@ -140,13 +139,18 @@ Your instructions:
 Core directive: Business-first mindset at all times. Every response is practical, actionable, and oriented toward measurable outcomes. Be direct and results-focused."""
 
     history = conn.execute("SELECT role, content FROM messages WHERE agent_id=? ORDER BY created_at", (aid,)).fetchall()
-    messages = [{"role": r["role"], "content": r["content"]} for r in history]
-    messages.append({"role": "user", "content": msg.message})
+
+    # Gemini uses 'model' instead of 'assistant' for role names
+    gemini_history = [
+        {"role": "model" if r["role"] == "assistant" else "user", "parts": [r["content"]]}
+        for r in history
+    ]
 
     try:
-        resp = client.messages.create(
-            model="claude-3-5-sonnet-20241022", max_tokens=2048, system=system, messages=messages)
-        reply = resp.content[0].text
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=system)
+        chat_session = model.start_chat(history=gemini_history)
+        response = chat_session.send_message(msg.message)
+        reply = response.text
     except Exception as e:
         conn.close(); raise HTTPException(500, str(e))
 

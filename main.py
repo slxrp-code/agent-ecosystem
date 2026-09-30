@@ -145,7 +145,7 @@ Core directive: Business-first mindset at all times. Every response is practical
 
     try:
         resp = client.messages.create(
-            model="claude-opus-4-5", max_tokens=2048, system=system, messages=messages)
+            model="claude-3-5-sonnet-20241022", max_tokens=2048, system=system, messages=messages)
         reply = resp.content[0].text
     except Exception as e:
         conn.close(); raise HTTPException(500, str(e))

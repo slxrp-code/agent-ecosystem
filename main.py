@@ -6,31 +6,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 import google.generativeai as genai
-import sqlite3
+import psycopg2
+import psycopg2.extras
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-DB_PATH = "ecosystem.db"
+genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    url = os.environ.get("DATABASE_URL", "")
+    # psycopg2 requires postgresql://, Render provides postgres://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    conn = psycopg2.connect(url)
+    conn.autocommit = False
     return conn
 
 def init_db():
     conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS agents (
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS agents (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
         color TEXT DEFAULT '#3b82f6', system_prompt TEXT NOT NULL,
         capabilities TEXT DEFAULT '[]', created_at TEXT NOT NULL)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS messages (
+    cur.execute("""CREATE TABLE IF NOT EXISTS messages (
         id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, role TEXT NOT NULL,
         content TEXT NOT NULL, created_at TEXT NOT NULL)""")
-    conn.commit(); conn.close()
+    conn.commit(); cur.close(); conn.close()
 
 init_db()
-genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
 class AgentCreate(BaseModel):
     name: str; role: str
@@ -48,8 +53,10 @@ class ChatMessage(BaseModel):
 
 def get_all_agents():
     conn = get_db()
-    rows = conn.execute("SELECT * FROM agents ORDER BY created_at").fetchall()
-    conn.close()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM agents ORDER BY created_at")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
     result = []
     for r in rows:
         a = dict(r); a['capabilities'] = json.loads(a['capabilities']); result.append(a)
@@ -86,48 +93,52 @@ def list_agents(): return get_all_agents()
 
 @app.post("/agents")
 def create_agent(data: AgentCreate):
-    conn = get_db(); aid = str(uuid.uuid4())
-    conn.execute("INSERT INTO agents VALUES (?,?,?,?,?,?,?)",
+    conn = get_db(); cur = conn.cursor(); aid = str(uuid.uuid4())
+    cur.execute("INSERT INTO agents VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (aid, data.name, data.role, data.color, data.system_prompt,
          json.dumps(data.capabilities), datetime.utcnow().isoformat()))
-    conn.commit(); conn.close()
+    conn.commit(); cur.close(); conn.close()
     return {"id": aid}
 
 @app.put("/agents/{aid}")
 def update_agent(aid: str, data: AgentUpdate):
-    conn = get_db(); fields, vals = [], []
-    if data.name is not None: fields.append("name=?"); vals.append(data.name)
-    if data.role is not None: fields.append("role=?"); vals.append(data.role)
-    if data.color is not None: fields.append("color=?"); vals.append(data.color)
-    if data.system_prompt is not None: fields.append("system_prompt=?"); vals.append(data.system_prompt)
-    if data.capabilities is not None: fields.append("capabilities=?"); vals.append(json.dumps(data.capabilities))
+    conn = get_db(); cur = conn.cursor(); fields, vals = [], []
+    if data.name is not None: fields.append("name=%s"); vals.append(data.name)
+    if data.role is not None: fields.append("role=%s"); vals.append(data.role)
+    if data.color is not None: fields.append("color=%s"); vals.append(data.color)
+    if data.system_prompt is not None: fields.append("system_prompt=%s"); vals.append(data.system_prompt)
+    if data.capabilities is not None: fields.append("capabilities=%s"); vals.append(json.dumps(data.capabilities))
     if fields:
         vals.append(aid)
-        conn.execute(f"UPDATE agents SET {','.join(fields)} WHERE id=?", vals)
+        cur.execute(f"UPDATE agents SET {','.join(fields)} WHERE id=%s", vals)
         conn.commit()
-    conn.close(); return {"status": "updated"}
+    cur.close(); conn.close(); return {"status": "updated"}
 
 @app.delete("/agents/{aid}")
 def delete_agent(aid: str):
-    conn = get_db()
-    conn.execute("DELETE FROM agents WHERE id=?", (aid,))
-    conn.execute("DELETE FROM messages WHERE agent_id=?", (aid,))
-    conn.commit(); conn.close(); return {"status": "deleted"}
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM agents WHERE id=%s", (aid,))
+    cur.execute("DELETE FROM messages WHERE agent_id=%s", (aid,))
+    conn.commit(); cur.close(); conn.close(); return {"status": "deleted"}
 
 @app.get("/agents/{aid}/messages")
 def get_messages(aid: str):
     conn = get_db()
-    rows = conn.execute("SELECT role, content, created_at FROM messages WHERE agent_id=? ORDER BY created_at", (aid,)).fetchall()
-    conn.close(); return [dict(r) for r in rows]
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT role, content, created_at FROM messages WHERE agent_id=%s ORDER BY created_at", (aid,))
+    rows = cur.fetchall(); cur.close(); conn.close()
+    return [dict(r) for r in rows]
 
 @app.post("/agents/{aid}/chat")
 def chat(aid: str, msg: ChatMessage):
     conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     if aid == "orchestrator":
         system = build_orchestrator_prompt()
     else:
-        row = conn.execute("SELECT * FROM agents WHERE id=?", (aid,)).fetchone()
-        if not row: conn.close(); raise HTTPException(404, "Agent not found")
+        cur.execute("SELECT * FROM agents WHERE id=%s", (aid,))
+        row = cur.fetchone()
+        if not row: cur.close(); conn.close(); raise HTTPException(404, "Agent not found")
         a = dict(row); caps = json.loads(a['capabilities'])
         system = f"""You are {a['name']}, a specialized {a['role']} agent in a business ecosystem.
 
@@ -138,9 +149,8 @@ Your instructions:
 
 Core directive: Business-first mindset at all times. Every response is practical, actionable, and oriented toward measurable outcomes. Be direct and results-focused."""
 
-    history = conn.execute("SELECT role, content FROM messages WHERE agent_id=? ORDER BY created_at", (aid,)).fetchall()
-
-    # Gemini uses 'model' instead of 'assistant' for role names
+    cur.execute("SELECT role, content FROM messages WHERE agent_id=%s ORDER BY created_at", (aid,))
+    history = cur.fetchall()
     gemini_history = [
         {"role": "model" if r["role"] == "assistant" else "user", "parts": [r["content"]]}
         for r in history
@@ -152,16 +162,16 @@ Core directive: Business-first mindset at all times. Every response is practical
         response = chat_session.send_message(msg.message)
         reply = response.text
     except Exception as e:
-        conn.close(); raise HTTPException(500, str(e))
+        cur.close(); conn.close(); raise HTTPException(500, str(e))
 
     now = datetime.utcnow().isoformat()
-    conn.execute("INSERT INTO messages VALUES (?,?,'user',?,?)", (str(uuid.uuid4()), aid, msg.message, now))
-    conn.execute("INSERT INTO messages VALUES (?,?,'assistant',?,?)", (str(uuid.uuid4()), aid, reply, now))
-    conn.commit(); conn.close()
+    cur.execute("INSERT INTO messages VALUES (%s,%s,'user',%s,%s)", (str(uuid.uuid4()), aid, msg.message, now))
+    cur.execute("INSERT INTO messages VALUES (%s,%s,'assistant',%s,%s)", (str(uuid.uuid4()), aid, reply, now))
+    conn.commit(); cur.close(); conn.close()
     return {"response": reply}
 
 @app.delete("/agents/{aid}/messages")
 def clear_messages(aid: str):
-    conn = get_db()
-    conn.execute("DELETE FROM messages WHERE agent_id=?", (aid,))
-    conn.commit(); conn.close(); return {"status": "cleared"}
+    conn = get_db(); cur = conn.cursor()
+    cur.execute("DELETE FROM messages WHERE agent_id=%s", (aid,))
+    conn.commit(); cur.close(); conn.close(); return {"status": "cleared"}

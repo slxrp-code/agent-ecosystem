@@ -14,6 +14,35 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 genai.configure(api_key=os.environ.get("GOOGLE_API_KEY", ""))
 
+# Ordered newest→oldest free Gemini models. App auto-falls back if one is deprecated.
+GEMINI_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+_working_model = None  # cached so every call does not retry
+
+def call_gemini(system: str, history: list, message: str) -> str:
+    global _working_model
+    # Try cached model first, then fall through the list
+    ordered = ([_working_model] + [m for m in GEMINI_MODELS if m != _working_model]) if _working_model else GEMINI_MODELS
+    last_err = None
+    for model_name in ordered:
+        try:
+            model = genai.GenerativeModel(model_name=model_name, system_instruction=system)
+            session = model.start_chat(history=history)
+            reply = session.send_message(message).text
+            _working_model = model_name  # lock in the one that worked
+            return reply
+        except Exception as e:
+            err = str(e)
+            if any(k in err.lower() for k in ("404", "not found", "deprecated", "no longer available", "does not exist")):
+                last_err = err
+                continue  # try next model
+            raise  # non-model error (bad API key, quota, etc) — surface immediately
+    raise HTTPException(500, f"No available Gemini model found. Last error: {last_err}")
+
 def get_db():
     url = os.environ.get("DATABASE_URL", "")
     # psycopg2 requires postgresql://, Render provides postgres://
@@ -157,10 +186,7 @@ Core directive: Business-first mindset at all times. Every response is practical
     ]
 
     try:
-        model = genai.GenerativeModel(model_name="gemini-3.8-flash", system_instruction=system)
-        chat_session = model.start_chat(history=gemini_history)
-        response = chat_session.send_message(msg.message)
-        reply = response.text
+        reply = call_gemini(system, gemini_history, msg.message)
     except Exception as e:
         cur.close(); conn.close(); raise HTTPException(500, str(e))
 

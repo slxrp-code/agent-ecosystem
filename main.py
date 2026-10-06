@@ -157,7 +157,7 @@ Core directive: Business-first mindset at all times. Every response is practical
     ]
 
     try:
-        model = genai.GenerativeModel(model_name="gemini-2.0-flash", system_instruction=system)
+        model = genai.GenerativeModel(model_name="gemini-3.8-flash", system_instruction=system)
         chat_session = model.start_chat(history=gemini_history)
         response = chat_session.send_message(msg.message)
         reply = response.text
